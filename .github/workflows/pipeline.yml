@@ -1,60 +1,30 @@
-name: Tourism Project Pipeline
-
+name: Tourism Project
 on:
+  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
-
   register-dataset:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true  # if the csv is tracked with Git LFS
 
-      - name: setup python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: install dependencies
+      - name: install deps
         run: |
           python -m pip install --upgrade pip
-          pip install "huggingface_hub>=0.23" pandas
+          pip install "huggingface_hub>=0.23"
 
-      - name: upload dataset to hugging face hub
+      - name: run data_register.py
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          python - <<'PY'
-          import os
-          from huggingface_hub import HfApi, create_repo
-          from huggingface_hub.utils import RepositoryNotFoundError
-          api = HfApi(token=os.environ["HF_TOKEN"])
-
-          # dataset repo where the CSV should live
-          repo_id = "cheeka84/tourism-package-pred"
-          repo_type = "dataset"
-
-          # ensure dataset repo exists
-          try:
-              api.repo_info(repo_id=repo_id, repo_type=repo_type)
-              print(f"dataset repo exists: {repo_id}")
-          except RepositoryNotFoundError:
-              print(f"creating dataset repo: {repo_id}")
-              create_repo(repo_id=repo_id, repo_type=repo_type, private=False, exist_ok=True, token=os.environ["HF_TOKEN"])
-
-          # upload local CSV (adjust path if your file is elsewhere)
-          local_csv = "tourism_package_pred/data/tourism.csv"
-          api.upload_file(
-              path_or_fileobj=local_csv,
-              path_in_repo="tourism.csv",
-              repo_id=repo_id,
-              repo_type=repo_type,
-              commit_message="add raw tourism dataset"
-          )
-          print("✅ uploaded dataset file to HF")
-          PY
+        run: python tourism_package_pred/model_building/data_register.py
 
   data-prep:
     needs: register-dataset
@@ -62,17 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install "huggingface_hub>=0.23" pandas scikit-learn hf_transfer
 
-      - name: run data preparation
+      - name: Run Data Preparation
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -84,96 +49,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install scikit-learn "xgboost>=1.7,<2.1" "mlflow>=2.12" pandas numpy "huggingface_hub>=0.23"
+          pip install scikit-learn "xgboost>=1.7,<2.1" "mlflow>=2.12" pandas numpy "huggingface_hub>=0.23" joblib
 
-      - name: start mlflow server (optional)
+      - name: Start MLflow Server
         run: |
-          nohup mlflow ui --host 0.0.0.0 --port 5000 >/dev/null 2>&1 & 
-          sleep 5
-
-      - name: model building (rf vs xgb, upload best)
+          nohup mlflow ui --host 0.0.0.0 --port 5000 >/dev/null 2>&1 &
+          sleep 5      
+      - name: Model Building
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python tourism_package_pred/model_building/train.py
-
+          
   deploy-hosting:
     needs: [model-traning, data-prep, register-dataset]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: setup python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install "huggingface_hub>=0.23"
-
-      - name: push files to frontend hugging face space
+          pip -q install streamlit
+      - name: Deployment
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python - <<'PY'
-          import os, pathlib
-          from huggingface_hub import HfApi, create_repo
-          from huggingface_hub.utils import RepositoryNotFoundError
+          python tourism_package_pred/hosting/hosting.py
+        run: |
+          python tourism_package_pred/deployment/app.py
 
-          api = HfApi(token=os.environ["HF_TOKEN"])
-
-          # create/update a Space for the Streamlit app
-          space_id = "cheeka84/tourism-package-app"
-          try:
-              api.repo_info(repo_id=space_id, repo_type="space")
-              print(f"space exists: {space_id}")
-          except RepositoryNotFoundError:
-              print(f"creating space: {space_id} (streamlit)")
-              create_repo(
-                  repo_id=space_id,
-                  repo_type="space",
-                  private=False,
-                  exist_ok=True,
-                  token=os.environ["HF_TOKEN"],
-                  space_sdk="streamlit",
-              )
-
-          # ensure a minimal requirements.txt alongside app.py
-          req_path = pathlib.Path("requirements.space.txt")
-          req_path.write_text(
-              "streamlit\n"
-              "pandas\n"
-              "numpy\n"
-              "scikit-learn\n"
-              "xgboost\n"
-              "huggingface_hub\n"
-              "joblib\n"
-          )
-
-          # upload app and requirements
-          api.upload_file(
-              path_or_fileobj="tourism_package_pred/deployment/app.py",
-              path_in_repo="app.py",
-              repo_id=space_id,
-              repo_type="space",
-              commit_message="deploy streamlit app"
-          )
-          api.upload_file(
-              path_or_fileobj=str(req_path),
-              path_in_repo="requirements.txt",
-              repo_id=space_id,
-              repo_type="space",
-              commit_message="add requirements for space"
-          )
-          print("✅ deployed Streamlit Space with app.py + requirements.txt")
-          PY
