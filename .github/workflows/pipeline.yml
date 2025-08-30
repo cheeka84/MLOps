@@ -79,6 +79,5 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python tourism_package_pred/hosting/hosting.py
-        run: |
           python tourism_package_pred/deployment/app.py
 
