@@ -1,4 +1,3 @@
-
 # trains rf and xgb, compares on test, uploads the best model to HF
 import os
 import numpy as np
@@ -17,7 +16,6 @@ from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.pipeline import make_pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, f1_score
-
 from sklearn.ensemble import RandomForestClassifier
 
 # ---------------- config (all lowercase) ----------------
@@ -52,6 +50,41 @@ def _dl(name: str) -> str:
         token=hf_token
     )
 
+# ---- probability helpers (class-safe) ----
+def _get_classes(fitted_estimator):
+    """
+    Works for sklearn Pipelines or bare estimators.
+    Returns numpy array of class labels in the order of predict_proba columns.
+    """
+    classes = getattr(fitted_estimator, "classes_", None)
+    if classes is None and hasattr(fitted_estimator, "named_steps"):
+        # final estimator is last step in a Pipeline
+        _, last = list(fitted_estimator.named_steps.items())[-1]
+        classes = getattr(last, "classes_", None)
+    if classes is None:
+        raise RuntimeError("Estimator has no classes_; cannot map probabilities.")
+    return np.asarray(classes)
+
+def _pos_index(classes: np.ndarray) -> int:
+    """
+    Heuristic: prefer numeric 1, else common positive labels, else numeric max, else index 1/0.
+    """
+    try:
+        if 1 in classes:
+            return int(np.where(classes == 1)[0][0])
+    except Exception:
+        pass
+    for label in ("Yes", "Purchased", "WillPurchase", "Positive", "True"):
+        try:
+            if label in classes:
+                return int(np.where(classes == label)[0][0])
+        except Exception:
+            pass
+    try:
+        return int(np.argmax(classes))
+    except Exception:
+        return 1 if len(classes) > 1 else 0
+
 # ---- load splits from HF ----
 xtrain = pd.read_csv(_dl("Xtrain.csv"))
 xtest  = pd.read_csv(_dl("Xtest.csv"))
@@ -81,10 +114,15 @@ preprocessor = ColumnTransformer(
     verbose_feature_names_out=False
 )
 
-# ---- scorer ----
+# ---- scorer (class-safe) ----
 def auc_scorer(estimator, xv, yv):
-    proba = estimator.predict_proba(xv)[:, 1]
-    return roc_auc_score(yv, proba)
+    proba = estimator.predict_proba(xv)
+    classes = _get_classes(estimator)
+    if len(classes) == 2:
+        pos_idx = _pos_index(classes)
+        return roc_auc_score(yv, proba[:, pos_idx])
+    else:
+        return roc_auc_score(yv, proba, multi_class="ovr")
 
 with mlflow.start_run(run_name="rf_vs_xgb"):
     # ======================= random forest =======================
@@ -92,11 +130,9 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
     rf_pipe = make_pipeline(preprocessor, rf)
 
     rf_grid = {
-        "randomforestclassifier__n_estimators": [300, 600],
-        "randomforestclassifier__max_depth": [None, 8, 12],
-        "randomforestclassifier__min_samples_split": [2, 5],
-        "randomforestclassifier__min_samples_leaf": [1, 2],
-        "randomforestclassifier__max_features": ["sqrt", "log2"],
+        "randomforestclassifier__n_estimators": [300, 600, 900],
+        "randomforestclassifier__max_depth": [10, 12, 15],
+        "randomforestclassifier__min_samples_split": [5, 8, 10]
     }
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -105,8 +141,11 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
         rf_gs.fit(xtrain, ytrain)
 
         rf_best = rf_gs.best_estimator_
-        proba_tr = rf_best.predict_proba(xtrain)[:, 1]
-        proba_te = rf_best.predict_proba(xtest)[:, 1]
+        rf_classes = _get_classes(rf_best)
+        rf_pos = _pos_index(rf_classes)
+
+        proba_tr = rf_best.predict_proba(xtrain)[:, rf_pos]
+        proba_te = rf_best.predict_proba(xtest)[:, rf_pos]
         yhat_tr = (proba_tr >= classification_threshold).astype(int)
         yhat_te = (proba_te >= classification_threshold).astype(int)
 
@@ -120,13 +159,13 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
         mlflow.log_metrics({
             "train_auc": float(auc_tr), "test_auc": float(auc_te),
             "test_f1": float(f1_te),
-            "test_precision_pos": float(rep_te["1"]["precision"]),
-            "test_recall_pos": float(rep_te["1"]["recall"]),
+            "test_precision_pos": float(rep_te[str(rf_classes[rf_pos])]["precision"]),
+            "test_recall_pos": float(rep_te[str(rf_classes[rf_pos])]["recall"]),
             "test_accuracy": float(rep_te["accuracy"]),
         })
 
-        cm = confusion_matrix(ytest, yhat_te, labels=[0, 1])
-        print("rf test cm [[tn fp],[fn tp]]:\n", cm)
+        cm = confusion_matrix(ytest, yhat_te, labels=rf_classes)
+        print("rf test cm (rows=true, cols=pred):\n", cm)
 
         joblib.dump(rf_best, rf_model_outpath)
         mlflow.log_artifact(str(rf_model_outpath), artifact_path="models")
@@ -148,12 +187,11 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
     xgb_pipe = make_pipeline(preprocessor, xgb_clf)
 
     xgb_grid = {
-        "xgbclassifier__n_estimators": [200, 400],
-        "xgbclassifier__max_depth": [3, 4],
+        "xgbclassifier__n_estimators": [200, 400, 1000],
+        "xgbclassifier__max_depth": [7, 10, 15],
         "xgbclassifier__learning_rate": [0.05, 0.1],
         "xgbclassifier__subsample": [0.8, 1.0],
-        "xgbclassifier__colsample_bytree": [0.6, 0.8],
-        "xgbclassifier__reg_lambda": [0.5, 1.0],
+        "xgbclassifier__colsample_bytree": [0.6, 0.8, 1.0],
     }
 
     with mlflow.start_run(run_name="xgb", nested=True):
@@ -161,12 +199,15 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
         xgb_gs.fit(xtrain, ytrain)
 
         xgb_best = xgb_gs.best_estimator_
-        proba_tr = xgb_best.predict_proba(xtrain)[:, 1]
-        proba_te = xgb_best.predict_proba(xtest)[:, 1]
+        xgb_classes = _get_classes(xgb_best)
+        xgb_pos = _pos_index(xgb_classes)
+
+        proba_tr = xgb_best.predict_proba(xtrain)[:, xgb_pos]
+        proba_te = xgb_best.predict_proba(xtest)[:, xgb_pos]
         yhat_tr = (proba_tr >= classification_threshold).astype(int)
         yhat_te = (proba_te >= classification_threshold).astype(int)
 
-        rep_te = classification_report(ytest,  yhat_te,  output_dict=True, zero_division=0)
+        rep_te = classification_report(ytest,  yhat_te, output_dict=True, zero_division=0)
         auc_tr = roc_auc_score(ytrain, proba_tr)
         auc_te = roc_auc_score(ytest,  proba_te)
         f1_te  = f1_score(ytest, yhat_te, zero_division=0)
@@ -176,13 +217,13 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
         mlflow.log_metrics({
             "train_auc": float(auc_tr), "test_auc": float(auc_te),
             "test_f1": float(f1_te),
-            "test_precision_pos": float(rep_te["1"]["precision"]),
-            "test_recall_pos": float(rep_te["1"]["recall"]),
+            "test_precision_pos": float(rep_te[str(xgb_classes[xgb_pos])]["precision"]),
+            "test_recall_pos": float(rep_te[str(xgb_classes[xgb_pos])]["recall"]),
             "test_accuracy": float(rep_te["accuracy"]),
         })
 
-        cm = confusion_matrix(ytest, yhat_te, labels=[0, 1])
-        print("xgb test cm [[tn fp],[fn tp]]:\n", cm)
+        cm = confusion_matrix(ytest, yhat_te, labels=xgb_classes)
+        print("xgb test cm (rows=true, cols=pred):\n", cm)
 
         joblib.dump(xgb_best, xgb_model_outpath)
         mlflow.log_artifact(str(xgb_model_outpath), artifact_path="models")
@@ -192,12 +233,19 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
     rf_loaded  = joblib.load(rf_model_outpath)
     xgb_loaded = joblib.load(xgb_model_outpath)
 
-    rf_auc  = roc_auc_score(ytest, rf_loaded.predict_proba(xtest)[:, 1])
-    xgb_auc = roc_auc_score(ytest, xgb_loaded.predict_proba(xtest)[:, 1])
+    # RF AUC
+    rf_classes = _get_classes(rf_loaded)
+    rf_pos = _pos_index(rf_classes)
+    rf_auc  = roc_auc_score(ytest, rf_loaded.predict_proba(xtest)[:, rf_pos])
+
+    # XGB AUC
+    xgb_classes = _get_classes(xgb_loaded)
+    xgb_pos = _pos_index(xgb_classes)
+    xgb_auc = roc_auc_score(ytest, xgb_loaded.predict_proba(xtest)[:, xgb_pos])
 
     if abs(rf_auc - xgb_auc) < 1e-6:
-        rf_f1  = f1_score(ytest, (rf_loaded.predict_proba(xtest)[:, 1] >= classification_threshold).astype(int), zero_division=0)
-        xgb_f1 = f1_score(ytest, (xgb_loaded.predict_proba(xtest)[:, 1] >= classification_threshold).astype(int), zero_division=0)
+        rf_f1  = f1_score(ytest, (rf_loaded.predict_proba(xtest)[:, rf_pos]  >= classification_threshold).astype(int), zero_division=0)
+        xgb_f1 = f1_score(ytest, (xgb_loaded.predict_proba(xtest)[:, xgb_pos] >= classification_threshold).astype(int), zero_division=0)
         best_name = "rf" if rf_f1 >= xgb_f1 else "xgb"
     else:
         best_name = "rf" if rf_auc > xgb_auc else "xgb"
@@ -224,11 +272,10 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
         create_repo(repo_id=model_repo_id, repo_type=model_repo_type, private=False, exist_ok=True, token=hf_token)
 
     api.upload_file(
-        path_or_fileobj=str(best_model_outpath),            # <-- cast to str
+        path_or_fileobj=str(best_model_outpath),
         path_in_repo=os.path.basename(best_model_outpath),
         repo_id=model_repo_id,
         repo_type=model_repo_type,
         commit_message=f"upload best model ({best_name}) for tourism package prediction"
     )
     print("✅ uploaded best model to hf:", f"{model_repo_id}/{os.path.basename(best_model_outpath)}")
-
