@@ -1,8 +1,13 @@
 name: Tourism Project
+
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  PYTHONUNBUFFERED: '1'
 
 jobs:
   register-dataset:
@@ -10,21 +15,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: true  # if the csv is tracked with Git LFS
+          lfs: true  # if the CSV is tracked with Git LFS
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
-      - name: install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "huggingface_hub>=0.23"
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install "huggingface_hub>=0.23"
+          fi
 
-      - name: run data_register.py
+      - name: Register dataset to HF Hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python tourism_package_pred/model_building/data_register.py
+        run: |
+          python tourism_package_pred/model_building/data_register.py
 
   data-prep:
     needs: register-dataset
@@ -32,52 +44,104 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "huggingface_hub>=0.23" pandas scikit-learn hf_transfer
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install "huggingface_hub>=0.23" pandas scikit-learn hf_transfer
+          fi
 
-      - name: Run Data Preparation
+      - name: Run data prep
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python tourism_package_pred/model_building/prep.py
 
-  model-traning:
+  model-training:
     needs: data-prep
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install scikit-learn "xgboost>=1.7,<2.1" "mlflow>=2.12" pandas numpy "huggingface_hub>=0.23" joblib
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install scikit-learn "xgboost>=1.7,<2.1" "mlflow>=2.12" pandas numpy "huggingface_hub>=0.23" joblib
+          fi
 
-      - name: Start MLflow Server
-        run: |
-          nohup mlflow ui --host 0.0.0.0 --port 5000 >/dev/null 2>&1 &
-          sleep 5      
-      - name: Model Building
+      # Optional: only needed if you intentionally log to this live UI
+      # - name: Start MLflow UI (optional)
+      #   run: |
+      #     nohup mlflow ui --host 0.0.0.0 --port 5000 >/dev/null 2>&1 &
+      #     sleep 5
+
+      - name: Train model
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # MLFLOW_TRACKING_URI: http://127.0.0.1:5000   # if using the UI above
         run: |
           python tourism_package_pred/model_building/train.py
-          
+
   deploy-hosting:
-    needs: [model-traning, data-prep, register-dataset]
+    needs: [model-training, data-prep, register-dataset]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Dependencies
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "huggingface_hub>=0.23"
-          pip -q install streamlit
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install "huggingface_hub>=0.23" streamlit joblib scikit-learn pandas numpy
+          fi
+
+      - name: Smoke test imports
+        run: |
+          python - << 'PY'
+          import joblib, sklearn, pandas, numpy, streamlit, huggingface_hub
+          print("✅ Imports OK")
+          PY
+
       - name: Deployment
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          # If this script publishes to HF Spaces or similar, keep it:
           python tourism_package_pred/hosting/hosting.py
-          python tourism_package_pred/deployment/app.py
+
+          # For the Streamlit app, don't "python app.py" directly.
+          # Either compile (smoke-test) or run headless (comment/uncomment as needed):
+
+          # Compile-only (fast import check):
+          python -m py_compile tourism_package_pred/deployment/app.py
+
+          # OR run headless briefly (uncomment to actually start it in CI):
+          # nohup streamlit run tourism_package_pred/deployment/app.py --server.headless true --server.port 8501 >/dev/null 2>&1 &
+          # sleep 10
+          # pkill -f "streamlit run" || true
 
