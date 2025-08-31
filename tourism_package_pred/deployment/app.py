@@ -1,8 +1,9 @@
+
+import joblib
 import streamlit as st
 import pandas as pd
 import numpy as np
 from huggingface_hub import hf_hub_download
-import joblib
 
 st.set_page_config(page_title="tourism package purchase", page_icon="🧳", layout="centered")
 
