@@ -1,11 +1,20 @@
 # trains rf and xgb, compares on test, uploads the best model to HF
+# ---------------------------------------------------------------
 import os
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
-import mlflow
-import xgboost as xgb
 import joblib
+import mlflow
+import mlflow.sklearn
+
+# xgboost may be optional on some runners
+try:
+    import xgboost as xgb
+    HAS_XGB = True
+except Exception:
+    HAS_XGB = False
 
 from huggingface_hub import hf_hub_download, HfApi, create_repo
 from huggingface_hub.utils import RepositoryNotFoundError
@@ -13,13 +22,13 @@ from huggingface_hub.utils import RepositoryNotFoundError
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer, make_column_selector
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, f1_score
 from sklearn.ensemble import RandomForestClassifier
 
 # ---------------- config (all lowercase) ----------------
-data_repo_id = "cheeka84/tourism-package-pred"   # HF dataset repo
+data_repo_id = "cheeka84/tourism-package-pred"   # HF dataset repo (with prepared splits)
 data_repo_type = "dataset"
 prefix = "prepared"                              # folder in dataset repo
 
@@ -27,17 +36,11 @@ hf_token = os.getenv("HF_TOKEN")
 if not hf_token:
     raise SystemExit("please set HF_TOKEN in the environment (do not hardcode).")
 
+# compute the store_dir EXACTLY as in your UI script
+store_dir = Path(os.getenv("MLFLOW_DIR") or ("/content/mlruns" if Path("/content").exists() else "mlruns")).resolve()
+store_dir.mkdir(parents=True, exist_ok=True)
+tracking_uri = store_dir.as_uri()  # file:///.../mlruns (absolute)
 
-
-tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
-if tracking_uri:
-    mlflow.set_tracking_uri(tracking_uri)
-else:
-    mlruns_dir = Path(os.getenv("MLFLOW_DIR", "mlruns")).resolve()
-    mlruns_dir.mkdir(parents=True, exist_ok=True)
-    mlflow.set_tracking_uri(mlruns_dir.as_uri())
-
-mlflow.set_experiment("tourism-rf-vs-xgb")
 
 
 output_dir = Path(os.getenv("OUTPUT_DIR", "outputs")).resolve()
@@ -48,6 +51,7 @@ xgb_model_outpath  = output_dir / "xgb_pipeline.joblib"
 best_model_outpath = output_dir / "best_pipeline.joblib"
 
 classification_threshold = 0.50
+RANDOM_STATE = 42
 # --------------------------------------------------------
 
 def _dl(name: str) -> str:
@@ -99,6 +103,8 @@ xtest  = pd.read_csv(_dl("Xtest.csv"))
 ytrain = pd.read_csv(_dl("ytrain.csv")).iloc[:, 0].astype(int)
 ytest  = pd.read_csv(_dl("ytest.csv")).iloc[:, 0].astype(int)
 
+print("Tracking URI:", mlflow.get_tracking_uri())
+print("Experiments existing:", [e.name for e in mlflow.search_experiments()])
 print("loaded from HF:",
       "xtrain", xtrain.shape, "| xtest", xtest.shape,
       "| ytrain", ytrain.shape, "| ytest", ytest.shape)
@@ -108,10 +114,19 @@ num_sel = make_column_selector(dtype_include=np.number)
 cat_sel = make_column_selector(dtype_exclude=np.number)
 
 numeric_pipe = make_pipeline(SimpleImputer(strategy="median"), StandardScaler())
-categorical_pipe = make_pipeline(
-    SimpleImputer(strategy="most_frequent"),
-    OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False)
-)
+
+# Backward compatibility for scikit-learn (sparse_output vs sparse)
+try:
+    categorical_pipe = make_pipeline(
+        SimpleImputer(strategy="most_frequent"),
+        OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False)
+    )
+except TypeError:
+    # older scikit-learn fallback
+    categorical_pipe = make_pipeline(
+        SimpleImputer(strategy="most_frequent"),
+        OneHotEncoder(drop="first", handle_unknown="ignore", sparse=False)
+    )
 
 preprocessor = ColumnTransformer(
     transformers=[
@@ -134,7 +149,7 @@ def auc_scorer(estimator, xv, yv):
 
 with mlflow.start_run(run_name="rf_vs_xgb"):
     # ======================= random forest =======================
-    rf = RandomForestClassifier(random_state=42, n_jobs=-1, class_weight="balanced")
+    rf = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1, class_weight="balanced")
     rf_pipe = make_pipeline(preprocessor, rf)
 
     rf_grid = {
@@ -142,13 +157,13 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
         "randomforestclassifier__max_depth": [10, 12, 15],
         "randomforestclassifier__min_samples_split": [5, 8, 10]
     }
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
     with mlflow.start_run(run_name="rf", nested=True):
         rf_gs = GridSearchCV(rf_pipe, rf_grid, cv=cv, n_jobs=-1, scoring=auc_scorer, error_score="raise")
         rf_gs.fit(xtrain, ytrain)
 
-        rf_best = rf_gs.best_estimator_
+        rf_best: Pipeline = rf_gs.best_estimator_
         rf_classes = _get_classes(rf_best)
         rf_pos = _pos_index(rf_classes)
 
@@ -172,104 +187,109 @@ with mlflow.start_run(run_name="rf_vs_xgb"):
             "test_accuracy": float(rep_te["accuracy"]),
         })
 
-        cm = confusion_matrix(ytest, yhat_te, labels=rf_classes)
+        cm = confusion_matrix(ytest, yhat_te, labels=sorted(np.unique(np.concatenate([ytest.values, rf_classes]))))
         print("rf test cm (rows=true, cols=pred):\n", cm)
 
+        # Save artifacts & MLflow model
         joblib.dump(rf_best, rf_model_outpath)
         mlflow.log_artifact(str(rf_model_outpath), artifact_path="models")
+        mlflow.sklearn.log_model(rf_best, artifact_path="rf_model")
         print("saved rf to:", rf_model_outpath)
 
     # ======================= xgboost =======================
-    pos = ytrain.value_counts().get(1, 0)
-    neg = ytrain.value_counts().get(0, 0)
-    scale_pos_weight = (neg / pos) if pos > 0 else 1.0
+    if HAS_XGB:
+        pos = ytrain.value_counts().get(1, 0)
+        neg = ytrain.value_counts().get(0, 0)
+        scale_pos_weight = (neg / pos) if pos > 0 else 1.0
 
-    xgb_clf = xgb.XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        tree_method="hist",
-        random_state=42,
-        n_jobs=-1,
-        scale_pos_weight=scale_pos_weight
-    )
-    xgb_pipe = make_pipeline(preprocessor, xgb_clf)
+        xgb_clf = xgb.XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+            scale_pos_weight=scale_pos_weight
+        )
+        xgb_pipe = make_pipeline(preprocessor, xgb_clf)
 
-    xgb_grid = {
-        "xgbclassifier__n_estimators": [200, 400, 1000],
-        "xgbclassifier__max_depth": [7, 10, 15],
-        "xgbclassifier__learning_rate": [0.05, 0.1],
-        "xgbclassifier__subsample": [0.8, 1.0],
-        "xgbclassifier__colsample_bytree": [0.6, 0.8, 1.0],
-    }
+        xgb_grid = {
+            "xgbclassifier__n_estimators": [200, 400, 1000],
+            "xgbclassifier__max_depth": [7, 10, 15],
+            "xgbclassifier__learning_rate": [0.05, 0.1],
+            "xgbclassifier__subsample": [0.8, 1.0],
+            "xgbclassifier__colsample_bytree": [0.6, 0.8, 1.0],
+        }
 
-    with mlflow.start_run(run_name="xgb", nested=True):
-        xgb_gs = GridSearchCV(xgb_pipe, xgb_grid, cv=cv, n_jobs=-1, scoring=auc_scorer, error_score="raise")
-        xgb_gs.fit(xtrain, ytrain)
+        with mlflow.start_run(run_name="xgb", nested=True):
+            xgb_gs = GridSearchCV(xgb_pipe, xgb_grid, cv=cv, n_jobs=-1, scoring=auc_scorer, error_score="raise")
+            xgb_gs.fit(xtrain, ytrain)
 
-        xgb_best = xgb_gs.best_estimator_
-        xgb_classes = _get_classes(xgb_best)
-        xgb_pos = _pos_index(xgb_classes)
+            xgb_best: Pipeline = xgb_gs.best_estimator_
+            xgb_classes = _get_classes(xgb_best)
+            xgb_pos = _pos_index(xgb_classes)
 
-        proba_tr = xgb_best.predict_proba(xtrain)[:, xgb_pos]
-        proba_te = xgb_best.predict_proba(xtest)[:, xgb_pos]
-        yhat_tr = (proba_tr >= classification_threshold).astype(int)
-        yhat_te = (proba_te >= classification_threshold).astype(int)
+            proba_tr = xgb_best.predict_proba(xtrain)[:, xgb_pos]
+            proba_te = xgb_best.predict_proba(xtest)[:, xgb_pos]
+            yhat_tr = (proba_tr >= classification_threshold).astype(int)
+            yhat_te = (proba_te >= classification_threshold).astype(int)
 
-        rep_te = classification_report(ytest,  yhat_te, output_dict=True, zero_division=0)
-        auc_tr = roc_auc_score(ytrain, proba_tr)
-        auc_te = roc_auc_score(ytest,  proba_te)
-        f1_te  = f1_score(ytest, yhat_te, zero_division=0)
+            rep_te = classification_report(ytest,  yhat_te, output_dict=True, zero_division=0)
+            auc_tr = roc_auc_score(ytrain, proba_tr)
+            auc_te = roc_auc_score(ytest,  proba_te)
+            f1_te  = f1_score(ytest, yhat_te, zero_division=0)
 
-        mlflow.log_params(xgb_gs.best_params_)
-        mlflow.log_param("threshold", classification_threshold)
-        mlflow.log_metrics({
-            "train_auc": float(auc_tr), "test_auc": float(auc_te),
-            "test_f1": float(f1_te),
-            "test_precision_pos": float(rep_te[str(xgb_classes[xgb_pos])]["precision"]),
-            "test_recall_pos": float(rep_te[str(xgb_classes[xgb_pos])]["recall"]),
-            "test_accuracy": float(rep_te["accuracy"]),
-        })
+            mlflow.log_params(xgb_gs.best_params_)
+            mlflow.log_param("threshold", classification_threshold)
+            mlflow.log_metrics({
+                "train_auc": float(auc_tr), "test_auc": float(auc_te),
+                "test_f1": float(f1_te),
+                "test_precision_pos": float(rep_te[str(xgb_classes[xgb_pos])]["precision"]),
+                "test_recall_pos": float(rep_te[str(xgb_classes[xgb_pos])]["recall"]),
+                "test_accuracy": float(rep_te["accuracy"]),
+            })
 
-        cm = confusion_matrix(ytest, yhat_te, labels=xgb_classes)
-        print("xgb test cm (rows=true, cols=pred):\n", cm)
+            cm = confusion_matrix(ytest, yhat_te, labels=sorted(np.unique(np.concatenate([ytest.values, xgb_classes]))))
+            print("xgb test cm (rows=true, cols=pred):\n", cm)
 
-        joblib.dump(xgb_best, xgb_model_outpath)
-        mlflow.log_artifact(str(xgb_model_outpath), artifact_path="models")
-        print("saved xgb to:", xgb_model_outpath)
+            joblib.dump(xgb_best, xgb_model_outpath)
+            mlflow.log_artifact(str(xgb_model_outpath), artifact_path="models")
+            mlflow.sklearn.log_model(xgb_best, artifact_path="xgb_model")
+            print("saved xgb to:", xgb_model_outpath)
 
     # ======================= choose best & upload =======================
     rf_loaded  = joblib.load(rf_model_outpath)
-    xgb_loaded = joblib.load(xgb_model_outpath)
-
-    # RF AUC
     rf_classes = _get_classes(rf_loaded)
     rf_pos = _pos_index(rf_classes)
     rf_auc  = roc_auc_score(ytest, rf_loaded.predict_proba(xtest)[:, rf_pos])
 
-    # XGB AUC
-    xgb_classes = _get_classes(xgb_loaded)
-    xgb_pos = _pos_index(xgb_classes)
-    xgb_auc = roc_auc_score(ytest, xgb_loaded.predict_proba(xtest)[:, xgb_pos])
+    if HAS_XGB and Path(xgb_model_outpath).exists():
+        xgb_loaded = joblib.load(xgb_model_outpath)
+        xgb_classes = _get_classes(xgb_loaded)
+        xgb_pos = _pos_index(xgb_classes)
+        xgb_auc = roc_auc_score(ytest, xgb_loaded.predict_proba(xtest)[:, xgb_pos])
+    else:
+        xgb_loaded, xgb_auc = None, -1.0
 
     if abs(rf_auc - xgb_auc) < 1e-6:
         rf_f1  = f1_score(ytest, (rf_loaded.predict_proba(xtest)[:, rf_pos]  >= classification_threshold).astype(int), zero_division=0)
-        xgb_f1 = f1_score(ytest, (xgb_loaded.predict_proba(xtest)[:, xgb_pos] >= classification_threshold).astype(int), zero_division=0)
+        xgb_f1 = f1_score(ytest, (xgb_loaded.predict_proba(xtest)[:, xgb_pos] >= classification_threshold).astype(int), zero_division=0) if xgb_loaded is not None else -1.0
         best_name = "rf" if rf_f1 >= xgb_f1 else "xgb"
     else:
         best_name = "rf" if rf_auc > xgb_auc else "xgb"
 
-    best_model_path = rf_model_outpath if best_name == "rf" else xgb_model_outpath
     best_model = rf_loaded if best_name == "rf" else xgb_loaded
+    best_auc = max(rf_auc, xgb_auc)
 
     joblib.dump(best_model, best_model_outpath)
     mlflow.log_artifact(str(best_model_outpath), artifact_path="models")
+    mlflow.sklearn.log_model(best_model, artifact_path="best_model")
     mlflow.log_param("best_model", best_name)
-    mlflow.log_metric("best_model_test_auc", float(max(rf_auc, xgb_auc)))
-    print(f"selected best model: {best_name} (auc={max(rf_auc, xgb_auc):.4f})")
+    mlflow.log_metric("best_model_test_auc", float(best_auc))
+    print(f"selected best model: {best_name} (auc={best_auc:.4f})")
     print("saved best to:", best_model_outpath)
 
-    # upload to HF model repo
-    model_repo_id = "cheeka84/tourism-package-pred"  # HF model repo
+    # ----- upload to HF model repo -----
+    model_repo_id = "cheeka84/tourism-package-pred"  # HF model repo (can be same name)
     model_repo_type = "model"
     api = HfApi(token=hf_token)
     try:
