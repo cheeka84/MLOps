@@ -41,7 +41,14 @@ store_dir = Path(os.getenv("MLFLOW_DIR") or ("/content/mlruns" if Path("/content
 store_dir.mkdir(parents=True, exist_ok=True)
 tracking_uri = store_dir.as_uri()  # file:///.../mlruns (absolute)
 
+# >>> THESE TWO LINES WERE MISSING <<<
+mlflow.set_tracking_uri(tracking_uri)
+mlflow.set_experiment(os.getenv("MLFLOW_EXPERIMENT", "tourism-rf-vs-xgb"))
 
+# quick smoke run so you can verify the store immediately
+with mlflow.start_run(run_name="__smoke__"):
+    mlflow.log_param("ping", "pong")
+    mlflow.log_metric("smoke_metric", 1.0)
 
 output_dir = Path(os.getenv("OUTPUT_DIR", "outputs")).resolve()
 output_dir.mkdir(parents=True, exist_ok=True)
