@@ -27,10 +27,18 @@ hf_token = os.getenv("HF_TOKEN")
 if not hf_token:
     raise SystemExit("please set HF_TOKEN in the environment (do not hardcode).")
 
-mlruns_dir = Path(os.getenv("MLFLOW_DIR", "mlruns")).resolve()
-mlruns_dir.mkdir(parents=True, exist_ok=True)
-mlflow.set_tracking_uri(mlruns_dir.as_uri())
+
+
+tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+if tracking_uri:
+    mlflow.set_tracking_uri(tracking_uri)
+else:
+    mlruns_dir = Path(os.getenv("MLFLOW_DIR", "mlruns")).resolve()
+    mlruns_dir.mkdir(parents=True, exist_ok=True)
+    mlflow.set_tracking_uri(mlruns_dir.as_uri())
+
 mlflow.set_experiment("tourism-rf-vs-xgb")
+
 
 output_dir = Path(os.getenv("OUTPUT_DIR", "outputs")).resolve()
 output_dir.mkdir(parents=True, exist_ok=True)
